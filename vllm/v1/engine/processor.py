@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import time
-from collections.abc import Mapping
+import typing
+from collections.abc import Mapping, Sequence
 from typing import Any, Literal, Optional, Union
 
 from vllm.config import VllmConfig
@@ -27,6 +28,11 @@ from vllm.v1.structured_output.backend_outlines import (
     validate_structured_output_request_outlines)
 from vllm.v1.structured_output.backend_xgrammar import (
     validate_xgrammar_grammar)
+
+if typing.TYPE_CHECKING:
+    import llguidance.hf
+    from llguidance import LLTokenizer
+    from transformers import PreTrainedTokenizerBase, PreTrainedTokenizerFast
 
 
 class Processor:
@@ -199,6 +205,20 @@ class Processor:
                              "not enabled!")
 
     def _validate_structured_output(self, params: SamplingParams) -> None:
+        def _guidance_tokenizer(tokenizer: Optional[Union["PreTrainedTokenizerBase", "LLTokenizer"]]) -> Optional["LLTokenizer"]:
+            # Import here so we don't unnecessarily import transformers or llguidance
+            from transformers import PreTrainedTokenizerFast
+            from llguidance import LLTokenizer
+            import llguidance.hf
+
+            if isinstance(tokenizer, LLTokenizer):
+                return tokenizer
+            elif isinstance(tokenizer, PreTrainedTokenizerFast):
+                return llguidance.hf.from_tokenizer(tokenizer)
+
+            # Unsupported tokenizer
+            return None
+
         if not params.guided_decoding or not self.decoding_config:
             return
 
@@ -238,11 +258,7 @@ class Processor:
             # xgrammar with no fallback
             validate_xgrammar_grammar(params)
         elif engine_level_backend.startswith("guidance"):
-            # TODO: ideally we would have the LLTokenizer here as Lark syntax
-            # allows <|special_token|> and similar, see
-            # https://github.com/guidance-ai/llguidance/blob/main/docs/syntax.md#special-tokens
-            # Without tokenizer these are disallowed in grammars.
-            validate_guidance_grammar(params, tokenizer=None)
+            validate_guidance_grammar(params, tokenizer=_guidance_tokenizer(params.guided_decoding.tokenizer))
         elif engine_level_backend == "outlines":
             # outlines backend
             validate_structured_output_request_outlines(params)
@@ -263,10 +279,13 @@ class Processor:
                 # The request either failed validation
                 # or includes some jsonschema feature(s) that
                 # are not supported in xgrammar. Fall back to guidance.
-                validate_guidance_grammar(params, tokenizer=None)
+                validate_guidance_grammar(params, tokenizer=_guidance_tokenizer(params.guided_decoding.tokenizer))
                 params.guided_decoding.backend = "guidance"
             # Remember that this backend was set automatically
             params.guided_decoding.backend_was_auto = True
+
+        # Throw away the tokenizer reference so its not passed across the worker processes
+        params.guided_decoding.tokenizer = None
 
     def _maybe_build_mm_hash_overrides(
         self,

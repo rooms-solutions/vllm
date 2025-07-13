@@ -43,6 +43,7 @@ class GuidedDecodingParams:
     disable_additional_properties: bool = False
     whitespace_pattern: Optional[str] = None
     structural_tag: Optional[str] = None
+    tokenizer: Optional[Any] = None
 
     @staticmethod
     def from_optional(

@@ -201,6 +201,11 @@ def serialize_guidance_grammar(
             tp = "regex"
         elif request_type == StructuredOutputOptions.GRAMMAR:
             tp = "grammar"
+
+            # Check if this a llguidance native grammar
+            # this is essentially the same check that llguidance performs internally
+            if isinstance(grammar_spec, str) and grammar_spec.lstrip().startswith("{"):
+                tp = "llguidance"
         elif request_type == StructuredOutputOptions.CHOICE:
             tp = "choice"
         elif request_type == StructuredOutputOptions.STRUCTURAL_TAG:
