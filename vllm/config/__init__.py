@@ -1373,6 +1373,9 @@ class ModelConfig:
         return getattr(self.hf_text_config, "sliding_window", None)
 
     def get_vocab_size(self) -> int:
+        if "vocab_size" in self.hf_config:
+            return self.hf_config.vocab_size
+
         return getattr(self.hf_text_config, "vocab_size", 0)
 
     def get_hidden_size(self) -> int:
