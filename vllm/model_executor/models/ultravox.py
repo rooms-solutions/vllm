@@ -18,6 +18,8 @@ from transformers.models.whisper.modeling_whisper import WhisperEncoder
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.activation import MulAndSilu, get_act_fn
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.model_loader import DefaultModelLoader
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.sampling_metadata import SamplingMetadata
@@ -246,11 +248,6 @@ class StackAudioFrames(nn.Module):
                                          C * self.stack_factor)
         return audio_embeds
 
-class RMSNorm(transformers.models.llama.modeling_llama.LlamaRMSNorm):
-    def __init__(self, hidden_size: int, init: float = 1, eps: float = 1e-6):
-        super().__init__(hidden_size=hidden_size, eps=eps)
-        self.weight.data.fill_(init)
-
 class ProjectionAdapter(nn.Module):
     """
     MLP projection adapter to map from a smaller LM hidden size to a larger LM hidden size.
@@ -300,10 +297,16 @@ class UltravoxProjector(nn.Module):
         self.hidden_dim = config.hidden_size
         self._pad_and_stack = StackAudioFrames(config.stack_factor)
         dim_in = config.audio_config.hidden_size * config.stack_factor
-        self.ln_pre = RMSNorm(dim_in, init=config.norm_init)
+        self.ln_pre = RMSNorm(dim_in)
         self.linear_1 = nn.Linear(dim_in, self.hidden_dim, bias=False)
         dim_mid = self.hidden_dim
-        self.act = transformers.activations.get_activation(config.projector_act)
+
+        if config.projector_act == "swiglu":
+            self.act = MulAndSilu()
+            dim_mid = dim_mid // 2
+        else:
+            self.act = get_act_fn(config.projector_act)
+
         dim_mid = dim_mid // 2 if config.projector_act == "swiglu" else dim_mid
 
         text_hidden = config.text_config.hidden_size
@@ -339,11 +342,11 @@ class UltravoxProjector(nn.Module):
         # Ultravox v0.4.1 and below uses layer_norm after the second linear layer,
         # while v0.5.0 and above uses layer_norm after the first linear layer.
         if config.projector_ln_mid:
-            self.ln_mid: nn.Module = RMSNorm(dim_mid, init=config.norm_init)
+            self.ln_mid: nn.Module = RMSNorm(dim_mid)
             self.ln_post: nn.Module = nn.Identity()
         else:
             self.ln_mid = nn.Identity()
-            self.ln_post = RMSNorm(post_dim, init=config.norm_init)
+            self.ln_post = RMSNorm(post_dim)
 
     def forward(self, audio_features: torch.Tensor) -> torch.Tensor:
         """
