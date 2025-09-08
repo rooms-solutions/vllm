@@ -7,6 +7,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, Literal, Optional, TypedDict, Union
 
 import torch
+import transformers
+import transformers.activations
 from torch import nn
 from torch.nn import functional as F
 from transformers import BatchFeature, ProcessorMixin
@@ -247,42 +249,133 @@ class StackAudioFrames(nn.Module):
         return audio_embeds
 
 
-class UltravoxProjector(nn.Module):
+class ProjectionAdapter(nn.Module):
+    """
+    MLP projection adapter to map from a smaller LM hidden size to a larger LM hidden size.
+    The architecture mirrors the one used by projector_regression_tool. It expects weights
+    saved under a Sequential called 'net', so the state_dict keys match 'net.*'.
+    """
+    def __init__(
+        self,
+        layer_dims: list[int],
+        use_weight_norm: bool = True,
+        dropout: float = 0.0,
+        act: str = "gelu",
+        norm_output: bool = False,
+    ):
+        super().__init__()
+        assert len(layer_dims) >= 2, "layer_dims must include at least [in_dim, out_dim]"
+        self.norm_output = norm_output
 
+        act_fn = transformers.activations.get_activation(act)
+
+        layers: list[nn.Module] = []
+        in_dim = layer_dims[0]
+        for i, out_dim in enumerate(layer_dims[1:]):
+            is_last = i == len(layer_dims) - 2
+            lin = nn.Linear(in_dim, out_dim, bias=False)
+            if use_weight_norm:
+                lin = torch.nn.utils.parametrizations.weight_norm(lin)  # type: ignore[assignment]
+            layers.append(lin)
+            if not is_last:
+                layers.append(nn.LayerNorm(out_dim))
+                layers.append(act_fn)
+                if dropout and dropout > 0:
+                    layers.append(nn.Dropout(dropout))
+            in_dim = out_dim
+
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.net(x)
+        if self.norm_output:
+            y = torch.nn.functional.normalize(y, dim=-1, eps=1e-8)
+        return y
+
+class UltravoxProjector(nn.Module):
     def __init__(self, config: UltravoxConfig):
         super().__init__()
         self.hidden_dim = config.hidden_size
         self._pad_and_stack = StackAudioFrames(config.stack_factor)
         dim_in = config.audio_config.hidden_size * config.stack_factor
-        self.ln_pre = RMSNorm(dim_in)
+        self.ln_pre = RMSNorm(dim_in, init=config.norm_init)
         self.linear_1 = nn.Linear(dim_in, self.hidden_dim, bias=False)
         dim_mid = self.hidden_dim
+        self.act = transformers.activations.get_activation(config.projector_act)
+        dim_mid = dim_mid // 2 if config.projector_act == "swiglu" else dim_mid
 
-        if config.projector_act == "swiglu":
-            self.act = MulAndSilu()
-            dim_mid = dim_mid // 2
+        text_hidden = config.text_config.hidden_size
+        self.projection_adapter: nn.Module | None = None
+        adapter_cfg = getattr(config, "projection_adapter_config", None)
+
+        if adapter_cfg:
+            # Determine layer dimensions
+            layer_dims = adapter_cfg.get("layer_dims", None)
+            if layer_dims is None:
+                in_dim = int(adapter_cfg.get("in_dim"))
+                out_dim = int(adapter_cfg.get("out_dim"))
+                depth = int(adapter_cfg.get("depth", 2))
+                hidden_mult = float(adapter_cfg.get("hidden_mult", 1.5))
+                hidden_dim = max(out_dim, int(in_dim * hidden_mult))
+                layer_dims = [in_dim] + [hidden_dim] * (max(0, depth - 1)) + [out_dim]
+
+            # Linear_2 maps to adapter input
+            self.linear_2 = nn.Linear(dim_mid, int(layer_dims[0]), bias=False)
+            self.projection_adapter = ProjectionAdapter(
+                layer_dims=layer_dims,
+                use_weight_norm=bool(adapter_cfg.get("use_weight_norm", True)),
+                dropout=float(adapter_cfg.get("dropout", 0.0)),
+                act=str(adapter_cfg.get("act", "gelu")),
+                norm_output=bool(adapter_cfg.get("norm_output", False)),
+            )
+            post_dim = text_hidden
         else:
-            self.act = get_act_fn(config.projector_act)
+            # Legacy path: direct projection to LM hidden size
+            self.linear_2 = nn.Linear(dim_mid, text_hidden, bias=False)
+            post_dim = text_hidden
 
-        dim_out = config.text_hidden_size
-        self.linear_2 = nn.Linear(dim_mid, dim_out, bias=False)
-
-        # Ultravox v0.4.1 and below use layer_norm after the second linear layer
+        # Ultravox v0.4.1 and below uses layer_norm after the second linear layer,
         # while v0.5.0 and above uses layer_norm after the first linear layer.
         if config.projector_ln_mid:
-            self.ln_mid: nn.Module = RMSNorm(dim_mid)
-            self.ln_post = nn.Identity()
+            self.ln_mid: nn.Module = RMSNorm(dim_mid, init=config.norm_init)
+            self.ln_post: nn.Module = nn.Identity()
         else:
             self.ln_mid = nn.Identity()
-            self.ln_post = RMSNorm(dim_out)
+            self.ln_post = RMSNorm(post_dim, init=config.norm_init)
 
     def forward(self, audio_features: torch.Tensor) -> torch.Tensor:
+        """
+        Takes in audio features from the audio tower and projects them to the text model's embedding space.
+        It reduces the number of frames by a factor of `stack_factor` and increases the number of channels by the same factor.
+        If the number of audio frames are not a multiple of the stack factor, the last few frames will be padded with zeros.
+
+        Input shape:
+            audio_features: B, T*S, C
+        Output shape:
+            hidden_states: B, T, D
+        Where:
+            B: batch size
+            F: number of frames in the audio tower
+            T: number of output embeddings
+                T = ceil(F / S)
+            S: stack factor
+            C: number of channels out of the encoder (aka audio tower)
+            H: hidden size of the projector (config.hidden_size)
+            D: dimension of the text model (config.text_config.hidden_size)
+
+        """
+        # B, F, C -> B, T, C*S
         audio_features = self._pad_and_stack(audio_features)
         audio_features = self.ln_pre(audio_features)
+        # B, T, C*S -> B, T, H
         hidden_states = self.linear_1(audio_features)
+        # B, T, H -> B, T, H/2 (assuming swiglu)
         hidden_states = self.act(hidden_states)
         hidden_states = self.ln_mid(hidden_states)
+        # B, T, H/2 -> B, T, D (or adapter in/out)
         hidden_states = self.linear_2(hidden_states)
+        if self.projection_adapter is not None:
+            hidden_states = self.projection_adapter(hidden_states)
         hidden_states = self.ln_post(hidden_states)
         return hidden_states
 
