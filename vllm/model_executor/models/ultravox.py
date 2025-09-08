@@ -307,8 +307,6 @@ class UltravoxProjector(nn.Module):
         else:
             self.act = get_act_fn(config.projector_act)
 
-        dim_mid = dim_mid // 2 if config.projector_act == "swiglu" else dim_mid
-
         text_hidden = config.text_config.hidden_size
         self.projection_adapter: nn.Module | None = None
         adapter_cfg = getattr(config, "projection_adapter_config", None)
