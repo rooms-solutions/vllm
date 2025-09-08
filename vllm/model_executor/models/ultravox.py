@@ -9,17 +9,15 @@ from typing import Any, Literal, Optional, TypedDict, Union
 import torch
 import transformers
 import transformers.activations
+import transformers.models
 from torch import nn
 from torch.nn import functional as F
 from transformers import BatchFeature, ProcessorMixin
 from transformers.models.whisper import WhisperFeatureExtractor
 from transformers.models.whisper.modeling_whisper import WhisperEncoder
-
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.activation import MulAndSilu, get_act_fn
-from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.model_loader import DefaultModelLoader
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.sampling_metadata import SamplingMetadata
@@ -248,6 +246,10 @@ class StackAudioFrames(nn.Module):
                                          C * self.stack_factor)
         return audio_embeds
 
+class RMSNorm(transformers.models.llama.modeling_llama.LlamaRMSNorm):
+    def __init__(self, hidden_size: int, init: float = 1, eps: float = 1e-6):
+        super().__init__(hidden_size=hidden_size, eps=eps)
+        self.weight.data.fill_(init)
 
 class ProjectionAdapter(nn.Module):
     """
